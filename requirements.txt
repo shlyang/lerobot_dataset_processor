@@ -1,0 +1,7 @@
+pyside6
+lerobot
+pandas
+tqdm
+numpy
+pillow
+pyqtgraph
