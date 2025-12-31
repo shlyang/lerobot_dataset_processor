@@ -1,16 +1,16 @@
 # LeRobot Dataset Processor GUI
 
-一个基于 PySide6 的图形化界面工具，用于查看和编辑 LeRobot 格式的数据集，提供类似 Rerun 的可视化体验。
+一个基于 PySide6 的图形化界面工具，用于查看和编辑 LeRobot 格式的数据集。
 
 ## 功能特性
-- ✅ 支持通过 `repo_id` 从 Hugging Face Hub 或本地加载数据集
-- ✅ Episode 导航栏，支持键盘快捷键切换（W/S 或 ↑/↓）
-- ✅ 图像实时预览（支持 PIL 和 torch tensor 格式）
-- ✅ State/Action 等向量数据的多维度折线图展示
-- ✅ 维度选择器，可自由开启/关闭特定维度的显示
-- ✅ 进度条拖动切换帧（A/D 或 ←/→ 键盘控制）
-- ✅ 同步的时间轴标尺，所有图表联动显示当前帧位置
-- ✅ 异步数据加载，避免界面卡顿
+- 支持通过 `repo_id` 从 Hugging Face Hub 或本地加载数据集
+- Episode 导航栏，支持键盘快捷键切换（W/S 或 ↑/↓）
+- 图像实时预览（支持 PIL 和 torch tensor 格式）
+- State/Action 等向量数据的多维度折线图展示
+- 维度选择器，可自由开启/关闭特定维度的显示
+- 进度条拖动切换帧（A/D 或 ←/→ 键盘控制）
+- 同步的时间轴标尺，所有图表联动显示当前帧位置
+- 异步数据加载，避免界面卡顿
 
 ## 安装与运行
 
@@ -42,5 +42,7 @@
 - `app.py`: GUI 界面实现（PySide6 + PyQtGraph）
 - `processor.py`: 数据集加载与处理逻辑
 - `requirements.txt`: 项目依赖
-- `references/`: LeRobot 官方参考代码
+
+## TODO
+- [ ] 增加数据集编辑功能
 
