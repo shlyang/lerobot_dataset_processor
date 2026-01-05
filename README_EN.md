@@ -8,11 +8,11 @@ A PySide6-based graphical interface tool for viewing and editing LeRobot format 
 
 ### Data Viewing
 - Load datasets from Hugging Face Hub or local paths via `repo_id`
-- Episode navigation bar with keyboard shortcuts (W/S or ↑/↓)
+- Episode navigation bar with keyboard shortcuts (↑/↓)
 - Real-time image preview (supports PIL and torch tensor formats)
 - Multi-dimensional line charts for State/Action vector data
 - Dimension selector to toggle specific dimensions on/off
-- Progress bar for frame navigation (A/D or ←/→ keyboard control)
+- Progress bar for frame navigation (←/→ keyboard control)
 - Synchronized timeline ruler with linked charts showing current frame position
 - Asynchronous data loading to prevent UI freezing
 
@@ -31,7 +31,7 @@ A PySide6-based graphical interface tool for viewing and editing LeRobot format 
 ### Requirements
 - Python 3.10+
 - PySide6
-- LeRobot
+- LeRobot 0.4.2
 
 ### Installation Steps
 
