@@ -1,18 +1,26 @@
 import sys
 import os
+import json
+import shutil
 import warnings
 import torch
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
+
+# Project directory for backup copies
+PROJECT_DIR = Path("/home/dzmitry/sandbox/trossen/lerobot-dataset-gui-sereact")
+APPROVALS_BACKUP_DIR = PROJECT_DIR / "approvals_backup"
 
 # 过滤 torchvision 和 lerobot 的视频解码相关警告
 warnings.filterwarnings('ignore', category=UserWarning, module='torchvision.io._video_deprecation_warning')
 warnings.filterwarnings('ignore', message='.*torchcodec.*not available.*')
 
 import numpy as np
+import pandas as pd
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QImage, QPixmap
+import pyarrow.parquet as pq
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QImage, QPixmap, QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QPushButton, QVBoxLayout, QWidget, QMessageBox, QListWidget,
@@ -74,6 +82,15 @@ class DatasetGui(QMainWindow):
         # Multi-camera support
         self.camera_labels: Dict[str, QLabel] = {}
         self.image_keys: List[str] = []
+        # Episode approval tracking
+        self.approved_episodes: Set[int] = set()
+        self.commented_episodes: Dict[int, str] = {}  # episode_idx -> comment
+        self.approvals_file_path: Optional[Path] = None
+        # Episode tasks (from parquet)
+        self.episode_tasks: Dict[int, str] = {}  # episode_idx -> task description
+        # Playback timer
+        self.playback_timer: Optional[QTimer] = None
+        self.playback_speed: float = 1.0  # 1x or 2x
         self.init_ui()
 
     def init_ui(self):
@@ -155,17 +172,36 @@ class DatasetGui(QMainWindow):
         self.show_all_cameras_cb.setChecked(False)
         self.show_all_cameras_cb.stateChanged.connect(self.on_show_all_cameras_changed)
         
-        # Trim buttons
-        self.mark_start_btn = QPushButton("Mark Trim Start")
-        self.mark_start_btn.clicked.connect(self.on_mark_start_clicked)
+        # Approve episode button
+        self.approve_btn = QPushButton("Approve Episode")
+        self.approve_btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
+        self.approve_btn.clicked.connect(self.on_approve_episode_clicked)
         
-        self.mark_end_btn = QPushButton("Mark Trim End")
-        self.mark_end_btn.clicked.connect(self.on_mark_end_clicked)
+        # Comment button
+        self.comment_btn = QPushButton("Comment")
+        self.comment_btn.setStyleSheet("background-color: #f39c12; color: white; font-weight: bold;")
+        self.comment_btn.clicked.connect(self.on_comment_episode_clicked)
+        
+        # Playback buttons
+        self.play_1x_btn = QPushButton("▶ 1x")
+        self.play_1x_btn.setStyleSheet("background-color: #3498db; color: white; font-weight: bold;")
+        self.play_1x_btn.clicked.connect(self.on_play_1x_clicked)
+        
+        self.play_2x_btn = QPushButton("▶ 2x")
+        self.play_2x_btn.setStyleSheet("background-color: #9b59b6; color: white; font-weight: bold;")
+        self.play_2x_btn.clicked.connect(self.on_play_2x_clicked)
+        
+        self.stop_btn = QPushButton("⏹")
+        self.stop_btn.setStyleSheet("background-color: #95a5a6; color: white; font-weight: bold;")
+        self.stop_btn.clicked.connect(self.on_stop_playback_clicked)
         
         labels_layout.addWidget(self.frame_label)
+        labels_layout.addWidget(self.play_1x_btn)
+        labels_layout.addWidget(self.play_2x_btn)
+        labels_layout.addWidget(self.stop_btn)
         labels_layout.addWidget(self.show_all_cameras_cb)
-        labels_layout.addWidget(self.mark_start_btn)
-        labels_layout.addWidget(self.mark_end_btn)
+        labels_layout.addWidget(self.approve_btn)
+        labels_layout.addWidget(self.comment_btn)
         labels_layout.addStretch()
         labels_layout.addWidget(self.timestamp_label)
         slider_vbox.addLayout(labels_layout)
@@ -725,6 +761,9 @@ class DatasetGui(QMainWindow):
         self.new_repo_input.clear()
         self.refresh_edit_ui()
         
+        # Try to load task description from episodes parquet
+        task_description = self.get_task_description(dataset)
+        
         # Table-based Feature Info for Alignment
         meta = dataset.meta
         sample = dataset[0]
@@ -741,7 +780,13 @@ class DatasetGui(QMainWindow):
             # Align columns using table
             rows.append(f"<tr><td width='150'><code>{k}</code></td><td width='200' style='color: #2980b9;'>{type_name}</td><td>shape: {shape}</td></tr>")
         
+        # Build info text with task at the top
+        task_html = ""
+        if task_description:
+            task_html = f"<b style='color: #e74c3c;'>Task:</b> <i>{task_description}</i><br><br>"
+        
         info_text = (
+            f"{task_html}"
             f"<b>Repo ID:</b> {dataset.repo_id}<br>"
             f"<b>Total Episodes:</b> {meta.total_episodes} | <b>Total Frames:</b> {meta.total_frames} | <b>FPS:</b> {meta.fps}<br>"
             f"<b>Robot Type:</b> {meta.robot_type}<br>"
@@ -753,6 +798,10 @@ class DatasetGui(QMainWindow):
         self.ep_list.clear()
         for i in range(dataset.meta.total_episodes):
             self.ep_list.addItem(f"Episode {i}")
+        
+        # Load approvals and update colors
+        self.load_approvals()
+        self.update_episode_list_colors()
         
         self.init_dimension_selectors(dataset)
         self.init_camera_grid(dataset)
@@ -923,6 +972,9 @@ class DatasetGui(QMainWindow):
     def on_episode_changed(self, row):
         if row < 0: return
         
+        # Stop any ongoing playback
+        self.stop_playback()
+        
         # 显示加载状态
         self.status_label.setText(f"Loading Episode {row}...")
         self.frame_slider.setEnabled(False)
@@ -938,6 +990,328 @@ class DatasetGui(QMainWindow):
         
         # 先设置第一帧，不等待全部数据加载
         self.frame_slider.setValue(start)
+        
+        # Update approve button state
+        self.update_approve_button_state(row)
+
+    def get_approvals_file_path(self) -> Optional[Path]:
+        """Get the path to the approvals JSON file in the dataset directory."""
+        if not self.processor.dataset:
+            return None
+        # The dataset root is typically ~/.cache/huggingface/lerobot/{org}/{dataset}
+        dataset_root = Path(self.processor.dataset.root)
+        return dataset_root / "episode_approvals.json"
+
+    def load_episode_tasks(self, dataset):
+        """Load task descriptions for all episodes from episodes parquet files."""
+        self.episode_tasks.clear()
+        
+        try:
+            dataset_root = Path(dataset.root)
+            # Structure: meta/episodes/chunk-XXX/file-XXX.parquet
+            episodes_dir = dataset_root / "meta" / "episodes"
+            
+            if not episodes_dir.exists():
+                print(f"Episodes directory not found: {episodes_dir}")
+                return
+            
+            # Collect all parquet files from chunk directories
+            all_dfs = []
+            chunk_dir = episodes_dir / "chunk-000"
+            
+            if chunk_dir.exists() and chunk_dir.is_dir():
+                parquet_files = sorted(chunk_dir.glob("*.parquet"))
+                for parquet_file in parquet_files:
+                    try:
+                        table = pq.read_table(parquet_file)
+                        df = table.to_pandas()
+                        all_dfs.append(df)
+                    except Exception as e:
+                        print(f"Warning: Could not read {parquet_file}: {e}")
+            
+            if not all_dfs:
+                print("No parquet files found in episodes directory")
+                return
+            
+            # Concatenate all dataframes
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            
+            # Extract tasks for each episode
+            if 'tasks' in combined_df.columns and 'episode_index' in combined_df.columns:
+                for _, row in combined_df.iterrows():
+                    ep_idx = int(row['episode_index'])
+                    tasks = row['tasks']
+                    
+                    # Tasks is usually a list of strings
+                    if isinstance(tasks, (list, np.ndarray)) and len(tasks) > 0:
+                        self.episode_tasks[ep_idx] = str(tasks[0])
+                    elif isinstance(tasks, str):
+                        self.episode_tasks[ep_idx] = tasks
+                
+                print(f"Loaded tasks for {len(self.episode_tasks)} episodes")
+            else:
+                print(f"Columns in parquet: {list(combined_df.columns)}")
+                
+        except Exception as e:
+            import traceback
+            print(f"Warning: Could not load episode tasks: {e}")
+            traceback.print_exc()
+
+    def get_task_description(self, dataset) -> Optional[str]:
+        """Get the first task description (for display in info panel)."""
+        # Load all episode tasks first
+        self.load_episode_tasks(dataset)
+        
+        # Return the first task if available
+        if self.episode_tasks:
+            first_ep = min(self.episode_tasks.keys())
+            return self.episode_tasks.get(first_ep)
+        return None
+
+    def load_approvals(self):
+        """Load episode approvals from the JSON file in the dataset directory."""
+        self.approved_episodes.clear()
+        self.commented_episodes.clear()
+        self.approvals_file_path = self.get_approvals_file_path()
+        
+        if self.approvals_file_path and self.approvals_file_path.exists():
+            try:
+                with open(self.approvals_file_path, 'r') as f:
+                    data = json.load(f)
+                    self.approved_episodes = set(data.get('approved_episodes', []))
+                    # Load comments (convert string keys back to int)
+                    comments_data = data.get('commented_episodes', {})
+                    self.commented_episodes = {int(k): v for k, v in comments_data.items()}
+                self.status_label.setText(f"Loaded {len(self.approved_episodes)} approved, {len(self.commented_episodes)} commented episodes")
+            except Exception as e:
+                self.status_label.setText(f"Warning: Could not load approvals: {e}")
+
+    def save_approvals(self):
+        """Save episode approvals to the JSON file in the dataset directory and backup."""
+        if not self.approvals_file_path:
+            self.approvals_file_path = self.get_approvals_file_path()
+        
+        if self.approvals_file_path:
+            try:
+                data = {
+                    'approved_episodes': sorted(list(self.approved_episodes)),
+                    'total_approved': len(self.approved_episodes),
+                    'commented_episodes': {str(k): v for k, v in self.commented_episodes.items()},
+                    'total_commented': len(self.commented_episodes)
+                }
+                # Save to dataset directory
+                with open(self.approvals_file_path, 'w') as f:
+                    json.dump(data, f, indent=2)
+                
+                # Also save backup copy to project directory
+                self.save_approvals_backup()
+            except Exception as e:
+                QMessageBox.warning(self, "Warning", f"Could not save approvals: {e}")
+
+    def save_approvals_backup(self):
+        """Save a backup copy of approvals to the project directory."""
+        if not self.approvals_file_path or not self.processor.dataset:
+            return
+        
+        try:
+            # Create backup directory if it doesn't exist
+            APPROVALS_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            
+            # Create a filename based on the dataset repo_id
+            repo_id = self.processor.dataset.repo_id
+            safe_name = repo_id.replace('/', '_')
+            backup_path = APPROVALS_BACKUP_DIR / f"{safe_name}_approvals.json"
+            
+            # Copy the file
+            shutil.copy2(self.approvals_file_path, backup_path)
+        except Exception as e:
+            # Don't show error for backup failures, just log to status
+            self.status_label.setText(f"Warning: Backup copy failed: {e}")
+
+    def on_approve_episode_clicked(self):
+        """Toggle approval status for the current episode."""
+        ep_idx = self.ep_list.currentRow()
+        if ep_idx < 0:
+            return
+        
+        if ep_idx in self.approved_episodes:
+            # Unapprove
+            self.approved_episodes.remove(ep_idx)
+            self.status_label.setText(f"Episode {ep_idx} unapproved")
+        else:
+            # Approve - also remove any comment
+            self.approved_episodes.add(ep_idx)
+            if ep_idx in self.commented_episodes:
+                del self.commented_episodes[ep_idx]
+            self.status_label.setText(f"Episode {ep_idx} approved")
+        
+        # Save to file
+        self.save_approvals()
+        
+        # Update UI
+        self.update_episode_list_colors()
+        self.update_approve_button_state(ep_idx)
+
+    def update_approve_button_state(self, ep_idx: int):
+        """Update the approve button text and style based on current episode's status."""
+        if ep_idx in self.approved_episodes:
+            self.approve_btn.setText("Unapprove Episode")
+            self.approve_btn.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+        else:
+            self.approve_btn.setText("Approve Episode")
+            self.approve_btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
+
+    def update_episode_list_colors(self):
+        """Update episode list item colors based on approval/comment status."""
+        for i in range(self.ep_list.count()):
+            item = self.ep_list.item(i)
+            # Build tooltip with task info
+            task_info = ""
+            if i in self.episode_tasks:
+                task_info = f"Task: {self.episode_tasks[i][:80]}..." if len(self.episode_tasks.get(i, "")) > 80 else f"Task: {self.episode_tasks.get(i, '')}"
+            
+            if i in self.approved_episodes:
+                # Green color for approved episodes
+                item.setForeground(QBrush(QColor("#27ae60")))
+                tooltip = "✓ Approved"
+                if task_info:
+                    tooltip = f"{tooltip}\n{task_info}"
+                item.setToolTip(tooltip)
+            elif i in self.commented_episodes:
+                # Yellow/orange color for commented episodes
+                item.setForeground(QBrush(QColor("#f39c12")))
+                tooltip = f"Comment: {self.commented_episodes[i]}"
+                if task_info:
+                    tooltip = f"{tooltip}\n{task_info}"
+                item.setToolTip(tooltip)
+            else:
+                # Default color (reset to black/default)
+                item.setForeground(QBrush(QColor("#000000")))
+                item.setToolTip(task_info if task_info else "")
+
+    def on_comment_episode_clicked(self):
+        """Open a dialog to add a comment to the current episode."""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+        
+        ep_idx = self.ep_list.currentRow()
+        if ep_idx < 0:
+            return
+        
+        # Create comment dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Comment on Episode {ep_idx}")
+        dialog.resize(400, 200)
+        d_layout = QVBoxLayout(dialog)
+        
+        d_layout.addWidget(QLabel("Enter your comment:"))
+        
+        comment_edit = QTextEdit()
+        # Pre-fill with existing comment if any
+        if ep_idx in self.commented_episodes:
+            comment_edit.setText(self.commented_episodes[ep_idx])
+        d_layout.addWidget(comment_edit)
+        
+        btns_layout = QHBoxLayout()
+        save_btn = QPushButton("Save Comment")
+        save_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        clear_btn = QPushButton("Clear Comment")
+        clear_btn.clicked.connect(lambda: comment_edit.clear())
+        btns_layout.addWidget(save_btn)
+        btns_layout.addWidget(clear_btn)
+        btns_layout.addWidget(cancel_btn)
+        d_layout.addLayout(btns_layout)
+        
+        if dialog.exec() == QDialog.Accepted:
+            comment_text = comment_edit.toPlainText().strip()
+            
+            if comment_text:
+                # Add comment and mark as NOT approved
+                self.commented_episodes[ep_idx] = comment_text
+                # Remove from approved if it was approved
+                if ep_idx in self.approved_episodes:
+                    self.approved_episodes.remove(ep_idx)
+                self.status_label.setText(f"Episode {ep_idx} commented")
+            else:
+                # Empty comment - remove comment
+                if ep_idx in self.commented_episodes:
+                    del self.commented_episodes[ep_idx]
+                self.status_label.setText(f"Episode {ep_idx} comment cleared")
+            
+            # Save to file
+            self.save_approvals()
+            
+            # Update UI
+            self.update_episode_list_colors()
+            self.update_approve_button_state(ep_idx)
+
+    def on_play_1x_clicked(self):
+        """Start playback at 1x speed."""
+        self.start_playback(1.0)
+        self.play_1x_btn.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; border: 2px solid white;")
+        self.play_2x_btn.setStyleSheet("background-color: #9b59b6; color: white; font-weight: bold;")
+
+    def on_play_2x_clicked(self):
+        """Start playback at 2x speed."""
+        self.start_playback(2.0)
+        self.play_2x_btn.setStyleSheet("background-color: #8e44ad; color: white; font-weight: bold; border: 2px solid white;")
+        self.play_1x_btn.setStyleSheet("background-color: #3498db; color: white; font-weight: bold;")
+
+    def on_stop_playback_clicked(self):
+        """Stop playback."""
+        self.stop_playback()
+
+    def start_playback(self, speed: float):
+        """Start playing frames at the given speed multiplier."""
+        if not self.processor.dataset:
+            return
+        
+        # Stop any existing playback first
+        if self.playback_timer:
+            self.playback_timer.stop()
+            self.playback_timer.deleteLater()
+            self.playback_timer = None
+        
+        self.playback_speed = speed
+        
+        # Get FPS from dataset metadata
+        fps = self.processor.dataset.meta.fps if hasattr(self.processor.dataset.meta, 'fps') else 30
+        
+        # Calculate interval in milliseconds
+        # At 1x speed, interval = 1000/fps ms
+        # At 2x speed, interval = 1000/(fps*2) = 500/fps ms
+        interval_ms = max(1, int(1000 / (fps * speed)))
+        
+        # Create and start timer with parent
+        self.playback_timer = QTimer(self)
+        self.playback_timer.timeout.connect(self.playback_next_frame)
+        self.playback_timer.start(interval_ms)
+        
+        self.status_label.setText(f"Playing at {speed}x speed ({fps} fps, interval: {interval_ms}ms)")
+
+    def stop_playback(self):
+        """Stop the playback timer."""
+        if self.playback_timer:
+            self.playback_timer.stop()
+            self.playback_timer.deleteLater()
+            self.playback_timer = None
+        
+        # Reset button styles
+        self.play_1x_btn.setStyleSheet("background-color: #3498db; color: white; font-weight: bold;")
+        self.play_2x_btn.setStyleSheet("background-color: #9b59b6; color: white; font-weight: bold;")
+
+    def playback_next_frame(self):
+        """Advance to the next frame during playback."""
+        current = self.frame_slider.value()
+        max_val = self.frame_slider.maximum()
+        
+        if current < max_val:
+            self.frame_slider.setValue(current + 1)
+        else:
+            # Reached end of episode, stop playback
+            self.stop_playback()
+            self.status_label.setText("Playback finished")
     
     def on_episode_data_loaded(self, data):
         """Callback when episode data is loaded."""
@@ -1101,8 +1475,19 @@ class DatasetGui(QMainWindow):
             self.frame_slider.setValue(max(self.frame_slider.minimum(), self.frame_slider.value() - 1))
         elif event.key() in [Qt.Key_D, Qt.Key_Right]:
             self.frame_slider.setValue(min(self.frame_slider.maximum(), self.frame_slider.value() + 1))
+        elif event.key() == Qt.Key_Space:
+            # Toggle playback with spacebar
+            if self.playback_timer and self.playback_timer.isActive():
+                self.stop_playback()
+            else:
+                self.start_playback(1.0)
         else:
             super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        """Stop playback when closing the application."""
+        self.stop_playback()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
