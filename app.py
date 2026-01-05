@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QPushButton, QVBoxLayout, QWidget, QMessageBox, QListWidget,
     QSlider, QSplitter, QScrollArea, QCheckBox, QGroupBox, QTextEdit,
-    QTreeWidget, QTreeWidgetItem, QTabWidget, QMenu, QListWidgetItem
+    QTreeWidget, QTreeWidgetItem, QTabWidget, QMenu, QListWidgetItem,
+    QGridLayout, QStackedWidget
 )
 
 from processor import DatasetProcessor
@@ -69,6 +70,9 @@ class DatasetGui(QMainWindow):
         self.vector_keys = []
         self.trim_start_frame: Optional[int] = None
         self.trim_end_frame: Optional[int] = None
+        # Multi-camera support
+        self.camera_labels: Dict[str, QLabel] = {}
+        self.image_keys: List[str] = []
         self.init_ui()
 
     def init_ui(self):
@@ -111,10 +115,24 @@ class DatasetGui(QMainWindow):
         image_slider_container = QWidget()
         image_slider_layout = QVBoxLayout(image_slider_container)
         
+        # Stacked widget for single/multi camera views
+        self.image_stack = QStackedWidget()
+        
+        # Single camera view (index 0)
         self.image_label = QLabel("No Image")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("background-color: black;")
-        image_slider_layout.addWidget(self.image_label, stretch=1)
+        self.image_stack.addWidget(self.image_label)
+        
+        # Multi-camera grid view (index 1)
+        self.multi_camera_widget = QWidget()
+        self.multi_camera_widget.setStyleSheet("background-color: black;")
+        self.multi_camera_layout = QGridLayout(self.multi_camera_widget)
+        self.multi_camera_layout.setSpacing(4)
+        self.multi_camera_layout.setContentsMargins(0, 0, 0, 0)
+        self.image_stack.addWidget(self.multi_camera_widget)
+        
+        image_slider_layout.addWidget(self.image_stack, stretch=1)
 
         # Slider and Labels
         slider_container = QWidget()
@@ -128,6 +146,11 @@ class DatasetGui(QMainWindow):
         self.frame_label = QLabel("Frame: 0/0")
         self.timestamp_label = QLabel("Timestamp: 0.000s")
         
+        # Show All Cameras checkbox
+        self.show_all_cameras_cb = QCheckBox("Show All Cameras")
+        self.show_all_cameras_cb.setChecked(False)
+        self.show_all_cameras_cb.stateChanged.connect(self.on_show_all_cameras_changed)
+        
         # Trim buttons
         self.mark_start_btn = QPushButton("Mark Trim Start")
         self.mark_start_btn.clicked.connect(self.on_mark_start_clicked)
@@ -136,6 +159,7 @@ class DatasetGui(QMainWindow):
         self.mark_end_btn.clicked.connect(self.on_mark_end_clicked)
         
         labels_layout.addWidget(self.frame_label)
+        labels_layout.addWidget(self.show_all_cameras_cb)
         labels_layout.addWidget(self.mark_start_btn)
         labels_layout.addWidget(self.mark_end_btn)
         labels_layout.addStretch()
@@ -684,8 +708,79 @@ class DatasetGui(QMainWindow):
             self.ep_list.addItem(f"Episode {i}")
         
         self.init_dimension_selectors(dataset)
+        self.init_camera_grid(dataset)
         if dataset.meta.total_episodes > 0:
             self.ep_list.setCurrentRow(0)
+
+    def init_camera_grid(self, dataset):
+        """Initialize the multi-camera grid based on available image/video keys."""
+        # Clear existing widgets from grid layout
+        while self.multi_camera_layout.count():
+            item = self.multi_camera_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.camera_labels.clear()
+        
+        # Find all image keys
+        sample = dataset[0]
+        self.image_keys = sorted([k for k in sample.keys() if 'image' in k])
+        
+        if not self.image_keys:
+            self.show_all_cameras_cb.setEnabled(False)
+            return
+        
+        self.show_all_cameras_cb.setEnabled(True)
+        
+        # Calculate grid dimensions (as square as possible)
+        num_cameras = len(self.image_keys)
+        cols = int(np.ceil(np.sqrt(num_cameras)))
+        rows = int(np.ceil(num_cameras / cols))
+        
+        # Create labels for each camera
+        for idx, key in enumerate(self.image_keys):
+            row = idx // cols
+            col = idx % cols
+            
+            # Create a container widget for each camera with label overlay
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+            
+            # Camera name label (extract short name from key)
+            short_name = key.split('.')[-1] if '.' in key else key
+            name_label = QLabel(short_name)
+            name_label.setStyleSheet("background-color: rgba(0, 0, 0, 150); color: white; padding: 2px 6px; font-size: 11px;")
+            name_label.setAlignment(Qt.AlignCenter)
+            
+            # Image label
+            img_label = QLabel("No Image")
+            img_label.setAlignment(Qt.AlignCenter)
+            img_label.setStyleSheet("background-color: #1a1a1a;")
+            img_label.setMinimumSize(100, 75)
+            
+            container_layout.addWidget(name_label)
+            container_layout.addWidget(img_label, stretch=1)
+            
+            self.multi_camera_layout.addWidget(container, row, col)
+            self.camera_labels[key] = img_label
+        
+        # Set equal stretch for all rows and columns
+        for r in range(rows):
+            self.multi_camera_layout.setRowStretch(r, 1)
+        for c in range(cols):
+            self.multi_camera_layout.setColumnStretch(c, 1)
+
+    def on_show_all_cameras_changed(self, state):
+        """Toggle between single and multi-camera view."""
+        if self.show_all_cameras_cb.isChecked():
+            self.image_stack.setCurrentIndex(1)  # Multi-camera grid
+        else:
+            self.image_stack.setCurrentIndex(0)  # Single camera
+        
+        # Refresh the current frame
+        if self.processor.dataset:
+            self.update_frame_view(self.frame_slider.value())
 
     def init_dimension_selectors(self, dataset):
         """Initializes the hierarchical feature tree."""
@@ -707,6 +802,10 @@ class DatasetGui(QMainWindow):
             # Convert to numpy to get shape
             v_np = val.numpy() if hasattr(val, 'numpy') else np.array(val)
             dims = v_np.shape[0] if v_np.ndim > 0 else 1
+            
+            # Get dimension names from metadata if available
+            feature_info = dataset.meta.features.get(k, {})
+            dim_names = feature_info.get('names', [])
             
             # Create Tree Item
             parent = QTreeWidgetItem(self.feature_tree)
@@ -731,7 +830,11 @@ class DatasetGui(QMainWindow):
             if dims > 1:
                 for d in range(dims):
                     child = QTreeWidgetItem(parent)
-                    child.setText(0, f"Dimension {d}")
+                    # Use actual name from metadata if available, otherwise fallback to "Dimension X"
+                    if d < len(dim_names):
+                        child.setText(0, dim_names[d])
+                    else:
+                        child.setText(0, f"Dimension {d}")
                     child.setCheckState(0, Qt.Checked)
                     child.setData(0, Qt.UserRole, (k, d))
 
@@ -857,51 +960,81 @@ class DatasetGui(QMainWindow):
                     if k in self.plot_curves and dim < len(self.plot_curves[k]):
                         self.plot_curves[k][dim].setVisible(is_child_checked)
 
+    def _convert_image_to_numpy(self, img_data) -> Optional[np.ndarray]:
+        """Convert various image formats to numpy array (HWC, uint8, RGB)."""
+        if hasattr(img_data, 'numpy'):  # Torch Tensor
+            img_np = img_data.numpy()
+            # Check if CHW format (channels first)
+            if img_np.ndim == 3 and img_np.shape[0] in [1, 3, 4]:
+                img_np = np.transpose(img_np, (1, 2, 0))  # CHW -> HWC
+            # Normalize to 0-255 uint8
+            if img_np.dtype == np.float32 or img_np.dtype == np.float64:
+                if img_np.max() <= 1.0:
+                    img_np = (img_np * 255).astype(np.uint8)
+                else:
+                    img_np = img_np.astype(np.uint8)
+        elif hasattr(img_data, 'convert'):  # PIL Image
+            img_np = np.array(img_data.convert('RGB'))
+        elif isinstance(img_data, dict) and 'path' in img_data:
+            # Video format - not yet supported
+            return None
+        else:
+            img_np = np.array(img_data)
+        
+        # Ensure C-contiguous array
+        img_np = np.ascontiguousarray(img_np)
+        
+        # Handle grayscale
+        if img_np.ndim == 2:
+            img_np = np.stack([img_np] * 3, axis=-1)
+        
+        return img_np
+
+    def _display_image_on_label(self, img_np: np.ndarray, label: QLabel):
+        """Display a numpy image array on a QLabel."""
+        h, w, c = img_np.shape
+        bytes_per_line = c * w
+        qimg = QImage(img_np.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(qimg)
+        
+        # Get label size, use minimum if too small
+        label_size = label.size()
+        if label_size.width() < 10 or label_size.height() < 10:
+            label_size = label.minimumSize()
+            if label_size.width() < 10:
+                label_size.setWidth(320)
+            if label_size.height() < 10:
+                label_size.setHeight(240)
+        
+        # Scale to fit label while keeping aspect ratio
+        scaled_pixmap = pixmap.scaled(
+            label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        label.setPixmap(scaled_pixmap)
+
     def update_frame_view(self, frame_idx):
         try:
             data = self.processor.get_frame(frame_idx)
-            # Find and display image
             img_keys = [k for k in data.keys() if 'image' in k]
-            if img_keys:
-                img_data = data[img_keys[0]]
-                
-                # Handle different image formats
-                if hasattr(img_data, 'numpy'):  # Torch Tensor
-                    img_np = img_data.numpy()
-                    # Check if CHW format (channels first)
-                    if img_np.ndim == 3 and img_np.shape[0] in [1, 3, 4]:
-                        img_np = np.transpose(img_np, (1, 2, 0))  # CHW -> HWC
-                    # Normalize to 0-255 uint8
-                    if img_np.dtype == np.float32 or img_np.dtype == np.float64:
-                        if img_np.max() <= 1.0:
-                            img_np = (img_np * 255).astype(np.uint8)
-                        else:
-                            img_np = img_np.astype(np.uint8)
-                elif hasattr(img_data, 'convert'):  # PIL Image
-                    img_np = np.array(img_data.convert('RGB'))
-                elif isinstance(img_data, dict) and 'path' in img_data:
-                    # Video format - need to decode
+            
+            if not img_keys:
+                return
+            
+            # Check if showing all cameras
+            if self.show_all_cameras_cb.isChecked() and len(self.camera_labels) > 0:
+                # Multi-camera view
+                for key in self.image_keys:
+                    if key in data and key in self.camera_labels:
+                        img_np = self._convert_image_to_numpy(data[key])
+                        if img_np is not None:
+                            self._display_image_on_label(img_np, self.camera_labels[key])
+            else:
+                # Single camera view (first camera)
+                img_np = self._convert_image_to_numpy(data[img_keys[0]])
+                if img_np is not None:
+                    self._display_image_on_label(img_np, self.image_label)
+                elif isinstance(data[img_keys[0]], dict) and 'path' in data[img_keys[0]]:
                     self.status_label.setText("Video format not yet supported in frame view")
-                    return
-                else:
-                    img_np = np.array(img_data)
-                
-                # Ensure C-contiguous array
-                img_np = np.ascontiguousarray(img_np)
-                
-                # Handle grayscale
-                if img_np.ndim == 2:
-                    img_np = np.stack([img_np] * 3, axis=-1)
-                
-                h, w, c = img_np.shape
-                bytes_per_line = c * w
-                qimg = QImage(img_np.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
-                pixmap = QPixmap.fromImage(qimg)
-                
-                # Scale to fit label while keeping aspect ratio
-                scaled_pixmap = pixmap.scaled(
-                    self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.image_label.setPixmap(scaled_pixmap)
+                    
         except Exception as e:
             self.status_label.setText(f"Error: {str(e)}")
             import traceback
