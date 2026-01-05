@@ -167,5 +167,6 @@ test_frame_*.png
 *.log
 data/
 outputs/
+approvals_backup/
 
 references/

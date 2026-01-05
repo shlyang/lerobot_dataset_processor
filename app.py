@@ -233,6 +233,8 @@ class DatasetGui(QMainWindow):
         self.feature_tree.setFocusPolicy(Qt.NoFocus)
         self.feature_tree.setHeaderLabel("Features & Dimensions")
         self.feature_tree.itemChanged.connect(self.on_tree_item_changed)
+        self.feature_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.feature_tree.customContextMenuRequested.connect(self.show_feature_tree_context_menu)
         self.right_tabs.addTab(self.feature_tree, "Features")
 
         # Tab 2: Edit
@@ -879,7 +881,7 @@ class DatasetGui(QMainWindow):
             self.update_frame_view(self.frame_slider.value())
 
     def init_dimension_selectors(self, dataset):
-        """Initializes the hierarchical feature tree."""
+        """Initializes the hierarchical feature tree with Left/Right groupings."""
         self.feature_tree.clear()
         # Clean up old plots
         for i in reversed(range(self.plot_layout.count())):
@@ -908,6 +910,8 @@ class DatasetGui(QMainWindow):
             parent.setText(0, k)
             parent.setCheckState(0, Qt.Checked)
             parent.setExpanded(True)
+            # Mark as feature parent
+            parent.setData(0, Qt.UserRole, {"type": "feature", "key": k})
             
             # Create Plot Widget
             pw = pg.PlotWidget(title=k)
@@ -923,32 +927,194 @@ class DatasetGui(QMainWindow):
             self.plot_layout.addWidget(pw)
             
             self.plot_curves[k] = []
+            
             if dims > 1:
+                # Categorize dimensions into left, right, and other
+                left_dims = []
+                right_dims = []
+                other_dims = []
+                
                 for d in range(dims):
-                    child = QTreeWidgetItem(parent)
-                    # Use actual name from metadata if available, otherwise fallback to "Dimension X"
                     if d < len(dim_names):
-                        child.setText(0, dim_names[d])
+                        name = dim_names[d]
                     else:
-                        child.setText(0, f"Dimension {d}")
-                    child.setCheckState(0, Qt.Checked)
-                    child.setData(0, Qt.UserRole, (k, d))
+                        name = f"Dimension {d}"
+                    
+                    name_lower = name.lower()
+                    if name_lower.startswith("left"):
+                        left_dims.append((d, name))
+                    elif name_lower.startswith("right"):
+                        right_dims.append((d, name))
+                    else:
+                        other_dims.append((d, name))
+                
+                # Create "Left" group if there are left joints
+                if left_dims:
+                    left_group = QTreeWidgetItem(parent)
+                    left_group.setText(0, "🔵 Left")
+                    left_group.setCheckState(0, Qt.Checked)
+                    left_group.setData(0, Qt.UserRole, {"type": "group", "key": k, "group": "left"})
+                    left_group.setExpanded(False)
+                    
+                    for d, name in left_dims:
+                        child = QTreeWidgetItem(left_group)
+                        child.setText(0, name)
+                        child.setCheckState(0, Qt.Checked)
+                        child.setData(0, Qt.UserRole, {"type": "dimension", "key": k, "dim": d})
+                
+                # Create "Right" group if there are right joints
+                if right_dims:
+                    right_group = QTreeWidgetItem(parent)
+                    right_group.setText(0, "🔴 Right")
+                    right_group.setCheckState(0, Qt.Checked)
+                    right_group.setData(0, Qt.UserRole, {"type": "group", "key": k, "group": "right"})
+                    right_group.setExpanded(False)
+                    
+                    for d, name in right_dims:
+                        child = QTreeWidgetItem(right_group)
+                        child.setText(0, name)
+                        child.setCheckState(0, Qt.Checked)
+                        child.setData(0, Qt.UserRole, {"type": "dimension", "key": k, "dim": d})
+                
+                # Add "Other" joints directly under parent (or in a group if many)
+                if other_dims:
+                    if left_dims or right_dims:
+                        # Create "Other" group only if we have left/right groups
+                        other_group = QTreeWidgetItem(parent)
+                        other_group.setText(0, "⚪ Other")
+                        other_group.setCheckState(0, Qt.Checked)
+                        other_group.setData(0, Qt.UserRole, {"type": "group", "key": k, "group": "other"})
+                        other_group.setExpanded(False)
+                        
+                        for d, name in other_dims:
+                            child = QTreeWidgetItem(other_group)
+                            child.setText(0, name)
+                            child.setCheckState(0, Qt.Checked)
+                            child.setData(0, Qt.UserRole, {"type": "dimension", "key": k, "dim": d})
+                    else:
+                        # No left/right groups, add directly under parent
+                        for d, name in other_dims:
+                            child = QTreeWidgetItem(parent)
+                            child.setText(0, name)
+                            child.setCheckState(0, Qt.Checked)
+                            child.setData(0, Qt.UserRole, {"type": "dimension", "key": k, "dim": d})
 
     def on_tree_item_changed(self, item, column):
         """Handles visibility toggles from the tree."""
-        key_data = item.data(0, Qt.UserRole)
+        item_data = item.data(0, Qt.UserRole)
         is_checked = item.checkState(0) == Qt.Checked
         
-        if key_data is None: # Parent item (Feature)
-            key = item.text(0)
-            if key in self.plots:
-                self.plots[key].setVisible(is_checked)
-            for i in range(item.childCount()):
-                item.child(i).setCheckState(0, item.checkState(0))
-        else: # Child item (Dimension)
-            key, dim = key_data
+        if not item_data:
+            return
+        
+        item_type = item_data.get("type")
+        key = item_data.get("key")
+        
+        if item_type == "feature":
+            # Feature parent (action, observation.state, etc.)
+            # Propagate check state to all children (groups and dimensions)
+            self._set_children_check_state(item, is_checked)
+            # Update plot visibility based on whether any dimension is visible
+            self._update_plot_visibility(key)
+            
+        elif item_type == "group":
+            # Left/Right/Other group - propagate to children only
+            self._set_children_check_state(item, is_checked)
+            # Update plot visibility
+            self._update_plot_visibility(key)
+            
+        elif item_type == "dimension":
+            # Individual dimension - update curve visibility
+            dim = item_data.get("dim")
             if key in self.plot_curves and dim < len(self.plot_curves[key]):
                 self.plot_curves[key][dim].setVisible(is_checked)
+            # Update plot visibility (show plot if at least one curve is visible)
+            self._update_plot_visibility(key)
+
+    def _set_children_check_state(self, item, checked: bool):
+        """Recursively set check state for all children."""
+        state = Qt.Checked if checked else Qt.Unchecked
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(0, state)
+            # Recurse for nested children (dimensions under groups)
+            self._set_children_check_state(child, checked)
+
+    def _update_plot_visibility(self, key: str):
+        """Update plot visibility based on whether any of its dimensions are checked."""
+        if key not in self.plots:
+            return
+        
+        # Find the feature parent item
+        for i in range(self.feature_tree.topLevelItemCount()):
+            parent = self.feature_tree.topLevelItem(i)
+            parent_data = parent.data(0, Qt.UserRole)
+            if parent_data and parent_data.get("key") == key:
+                # Check if any dimension is checked
+                any_visible = self._has_any_checked_dimension(parent)
+                self.plots[key].setVisible(any_visible)
+                
+                # Also update individual curve visibility
+                self._update_curves_visibility(parent, key)
+                break
+
+    def _has_any_checked_dimension(self, item) -> bool:
+        """Recursively check if any dimension under this item is checked."""
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_data = child.data(0, Qt.UserRole)
+            if child_data:
+                if child_data.get("type") == "dimension":
+                    if child.checkState(0) == Qt.Checked:
+                        return True
+                else:
+                    # It's a group, recurse
+                    if self._has_any_checked_dimension(child):
+                        return True
+        return False
+
+    def _update_curves_visibility(self, item, key: str):
+        """Recursively update curve visibility for all dimensions under this item."""
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_data = child.data(0, Qt.UserRole)
+            if child_data:
+                if child_data.get("type") == "dimension":
+                    dim = child_data.get("dim")
+                    is_checked = child.checkState(0) == Qt.Checked
+                    if key in self.plot_curves and dim < len(self.plot_curves[key]):
+                        self.plot_curves[key][dim].setVisible(is_checked)
+                else:
+                    # It's a group, recurse
+                    self._update_curves_visibility(child, key)
+
+    def show_feature_tree_context_menu(self, position):
+        """Show context menu for feature tree with left/right selection options."""
+        item = self.feature_tree.itemAt(position)
+        if not item:
+            return
+        
+        # Find the feature parent item (action, observation.state, etc.)
+        feature_item = item
+        while feature_item.parent():
+            feature_item = feature_item.parent()
+        
+        menu = QMenu()
+        
+        # Add check/uncheck all
+        check_all = menu.addAction("✓ Check all")
+        uncheck_all = menu.addAction("✗ Uncheck all")
+        
+        # Connect actions
+        check_all.triggered.connect(lambda: self.set_all_joints(feature_item, True))
+        uncheck_all.triggered.connect(lambda: self.set_all_joints(feature_item, False))
+        
+        menu.exec(self.feature_tree.mapToGlobal(position))
+
+    def set_all_joints(self, parent_item, checked: bool):
+        """Check or uncheck all child items recursively."""
+        state = Qt.Checked if checked else Qt.Unchecked
+        parent_item.setCheckState(0, state)
 
     def on_slider_changed(self, value):
         start = self.frame_slider.minimum()
@@ -1366,20 +1532,22 @@ class DatasetGui(QMainWindow):
         """Updates which curves are shown based on checkboxes in the feature tree."""
         for i in range(self.feature_tree.topLevelItemCount()):
             parent = self.feature_tree.topLevelItem(i)
-            key = parent.text(0)
-            is_parent_checked = parent.checkState(0) == Qt.Checked
+            parent_data = parent.data(0, Qt.UserRole)
+            if not parent_data:
+                continue
+            
+            key = parent_data.get("key")
+            if not key:
+                continue
+            
+            # Check if any dimension is visible
+            any_visible = self._has_any_checked_dimension(parent)
             
             if key in self.plots:
-                self.plots[key].setVisible(is_parent_checked)
+                self.plots[key].setVisible(any_visible)
             
-            for j in range(parent.childCount()):
-                child = parent.child(j)
-                key_data = child.data(0, Qt.UserRole)
-                if key_data:
-                    k, dim = key_data
-                    is_child_checked = child.checkState(0) == Qt.Checked
-                    if k in self.plot_curves and dim < len(self.plot_curves[k]):
-                        self.plot_curves[k][dim].setVisible(is_child_checked)
+            # Update all curve visibility recursively
+            self._update_curves_visibility(parent, key)
 
     def _convert_image_to_numpy(self, img_data) -> Optional[np.ndarray]:
         """Convert various image formats to numpy array (HWC, uint8, RGB)."""
