@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Set
 
 # Project directory for backup copies
-PROJECT_DIR = Path("/home/dzmitry/sandbox/trossen/lerobot-dataset-gui-sereact")
+PROJECT_DIR = Path(__file__).parent
 APPROVALS_BACKUP_DIR = PROJECT_DIR / "approvals_backup"
 
 # 过滤 torchvision 和 lerobot 的视频解码相关警告
@@ -1141,20 +1141,17 @@ class DatasetGui(QMainWindow):
         # Stop any ongoing playback
         self.stop_playback()
         
-        # 显示加载状态
         self.status_label.setText(f"Loading Episode {row}...")
         self.frame_slider.setEnabled(False)
         
         start, end = self.processor.get_episode_range(row)
         self.frame_slider.setRange(start, end - 1)
         
-        # 异步加载 episode 数据
         self.episode_loader = EpisodeLoaderThread(self.processor, row, self.vector_keys)
         self.episode_loader.finished.connect(self.on_episode_data_loaded)
         self.episode_loader.error.connect(self.on_episode_load_error)
         self.episode_loader.start()
         
-        # 先设置第一帧，不等待全部数据加载
         self.frame_slider.setValue(start)
         
         # Update approve button state
@@ -1512,10 +1509,8 @@ class DatasetGui(QMainWindow):
                 pw.addItem(curve)
                 self.plot_curves[k].append(curve)
                 
-            # 统一设置 X 轴范围，确保对齐
             pw.setXRange(0, num_frames, padding=0)
             
-            # 如果是 reward/done/success，设置合理的 Y 轴范围
             if any(x in k for x in ['reward', 'done', 'success']):
                 pw.setYRange(-0.1, 1.1, padding=0)
         
@@ -1634,7 +1629,6 @@ class DatasetGui(QMainWindow):
         QMessageBox.critical(self, "Error", err)
 
     def keyPressEvent(self, event):
-        # 强制让 slider 或 list 处理，或者直接由 window 处理
         if event.key() in [Qt.Key_W, Qt.Key_Up]:
             self.ep_list.setCurrentRow(max(0, self.ep_list.currentRow() - 1))
         elif event.key() in [Qt.Key_S, Qt.Key_Down]:
